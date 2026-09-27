@@ -25,6 +25,19 @@ const (
 	FilterNearest
 )
 
+// SharedImage is a D3D11 texture created in another device with
+// D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX. The Windows D3D11 renderer opens
+// it and samples it as BGRA. The producer AcquireSync(0) / ReleaseSync(1);
+// the renderer holds key 1 until the texture is no longer painted.
+// Other renderers cannot sample it.
+type SharedImage struct {
+	// Handle is the HANDLE from IDXGIResource::GetSharedHandle.
+	// It must not be closed.
+	Handle uintptr
+	Width  int
+	Height int
+}
+
 // ImageOp sets the brush to an image.
 type ImageOp struct {
 	Filter ImageFilter
@@ -32,6 +45,7 @@ type ImageOp struct {
 	uniform bool
 	color   color.NRGBA
 	src     *image.RGBA
+	shared  *SharedImage
 
 	// handle is a key to uniquely identify this ImageOp
 	// in a map of cached textures.
@@ -96,7 +110,24 @@ func NewImageOp(src image.Image) ImageOp {
 	}
 }
 
+// NewSharedImageOp paints a texture that is already on the GPU.
+// Handle is the cache key: the same handle reuses the shader view while
+// the producer updates the texture in place. A zero handle records nothing.
+func NewSharedImageOp(img SharedImage) ImageOp {
+	if img.Handle == 0 || img.Width < 1 || img.Height < 1 {
+		return ImageOp{}
+	}
+	s := img
+	return ImageOp{
+		shared: &s,
+		handle: img.Handle,
+	}
+}
+
 func (i ImageOp) Size() image.Point {
+	if i.shared != nil {
+		return image.Pt(i.shared.Width, i.shared.Height)
+	}
 	if i.src == nil {
 		return image.Point{}
 	}
@@ -109,7 +140,17 @@ func (i ImageOp) Add(o *op.Ops) {
 			Color: i.color,
 		}.Add(o)
 		return
-	} else if i.src == nil || i.src.Bounds().Empty() {
+	}
+	if i.shared != nil {
+		if i.shared.Handle == 0 || i.shared.Width < 1 || i.shared.Height < 1 {
+			return
+		}
+		data := ops.Write2(&o.Internal, ops.TypeImageLen, i.shared, i.handle)
+		data[0] = byte(ops.TypeImage)
+		data[1] = byte(i.Filter)
+		return
+	}
+	if i.src == nil || i.src.Bounds().Empty() {
 		return
 	}
 	data := ops.Write2(&o.Internal, ops.TypeImageLen, i.src, i.handle)

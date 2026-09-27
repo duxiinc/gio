@@ -348,6 +348,21 @@ type Texture2D struct {
 	}
 }
 
+// KeyedMutex is an IDXGIKeyedMutex. The vtable matches the inheritance
+// IUnknown, IDXGIObject, IDXGIDeviceSubObject, then AcquireSync/ReleaseSync.
+type KeyedMutex struct {
+	Vtbl *struct {
+		_IUnknownVTbl
+		SetPrivateData          uintptr
+		SetPrivateDataInterface uintptr
+		GetPrivateData          uintptr
+		GetParent               uintptr
+		GetDevice               uintptr
+		AcquireSync             uintptr
+		ReleaseSync             uintptr
+	}
+}
+
 type Buffer struct {
 	Vtbl *struct {
 		_IUnknownVTbl
@@ -611,11 +626,12 @@ type RASTERIZER_DESC struct {
 }
 
 var (
-	IID_Texture2D    = GUID{0x6f15aaf2, 0xd208, 0x4e89, 0x9a, 0xb4, 0x48, 0x95, 0x35, 0xd3, 0x4f, 0x9c}
-	IID_IDXGIDebug   = GUID{0x119E7452, 0xDE9E, 0x40fe, 0x88, 0x06, 0x88, 0xF9, 0x0C, 0x12, 0xB4, 0x41}
-	IID_IDXGIDevice  = GUID{0x54ec77fa, 0x1377, 0x44e6, 0x8c, 0x32, 0x88, 0xfd, 0x5f, 0x44, 0xc8, 0x4c}
-	IID_IDXGIFactory = GUID{0x7b7166ec, 0x21c7, 0x44ae, 0xb2, 0x1a, 0xc9, 0xae, 0x32, 0x1a, 0xe3, 0x69}
-	IID_ID3D11Debug  = GUID{0x79cf2233, 0x7536, 0x4948, 0x9d, 0x36, 0x1e, 0x46, 0x92, 0xdc, 0x57, 0x60}
+	IID_Texture2D       = GUID{0x6f15aaf2, 0xd208, 0x4e89, 0x9a, 0xb4, 0x48, 0x95, 0x35, 0xd3, 0x4f, 0x9c}
+	IID_IDXGIKeyedMutex = GUID{0x9d8e1289, 0xd7b3, 0x465f, 0x81, 0x26, 0x25, 0x0e, 0x34, 0x9a, 0xf8, 0x5d}
+	IID_IDXGIDebug      = GUID{0x119E7452, 0xDE9E, 0x40fe, 0x88, 0x06, 0x88, 0xF9, 0x0C, 0x12, 0xB4, 0x41}
+	IID_IDXGIDevice     = GUID{0x54ec77fa, 0x1377, 0x44e6, 0x8c, 0x32, 0x88, 0xfd, 0x5f, 0x44, 0xc8, 0x4c}
+	IID_IDXGIFactory    = GUID{0x7b7166ec, 0x21c7, 0x44ae, 0xb2, 0x1a, 0xc9, 0xae, 0x32, 0x1a, 0xe3, 0x69}
+	IID_ID3D11Debug     = GUID{0x79cf2233, 0x7536, 0x4948, 0x9d, 0x36, 0x1e, 0x46, 0x92, 0xdc, 0x57, 0x60}
 
 	DXGI_DEBUG_ALL = GUID{0xe48ae283, 0xda80, 0x490b, 0x87, 0xe6, 0x43, 0xe9, 0xa9, 0xcf, 0xda, 0x8}
 )
@@ -644,6 +660,8 @@ const (
 	DXGI_FORMAT_R32G32B32A32_FLOAT  = 2
 	DXGI_FORMAT_R8G8B8A8_UNORM      = 28
 	DXGI_FORMAT_R8G8B8A8_UNORM_SRGB = 29
+	DXGI_FORMAT_B8G8R8A8_UNORM      = 87
+	DXGI_FORMAT_B8G8R8A8_UNORM_SRGB = 91
 	DXGI_FORMAT_R16_SINT            = 59
 	DXGI_FORMAT_R16G16_SINT         = 38
 	DXGI_FORMAT_R16_UINT            = 57
@@ -1036,6 +1054,51 @@ func (d *Device) CreateTexture2D(desc *TEXTURE2D_DESC) (*Texture2D, error) {
 		return nil, ErrorCode{Name: "CreateTexture2D", Code: uint32(r)}
 	}
 	return tex, nil
+}
+
+func (d *Device) OpenSharedResource(handle uintptr, iid *GUID) (*IUnknown, error) {
+	var out *IUnknown
+	r, _, _ := syscall.Syscall6(
+		d.Vtbl.OpenSharedResource,
+		4,
+		uintptr(unsafe.Pointer(d)),
+		handle,
+		uintptr(unsafe.Pointer(iid)),
+		uintptr(unsafe.Pointer(&out)),
+		0, 0,
+	)
+	if r != 0 {
+		return nil, ErrorCode{Name: "OpenSharedResource", Code: uint32(r)}
+	}
+	return out, nil
+}
+
+func (m *KeyedMutex) AcquireSync(key uint64, timeout uint32) error {
+	r, _, _ := syscall.Syscall(
+		m.Vtbl.AcquireSync,
+		3,
+		uintptr(unsafe.Pointer(m)),
+		uintptr(key),
+		uintptr(timeout),
+	)
+	if r != 0 {
+		return ErrorCode{Name: "AcquireSync", Code: uint32(r)}
+	}
+	return nil
+}
+
+func (m *KeyedMutex) ReleaseSync(key uint64) error {
+	r, _, _ := syscall.Syscall(
+		m.Vtbl.ReleaseSync,
+		2,
+		uintptr(unsafe.Pointer(m)),
+		uintptr(key),
+		0,
+	)
+	if r != 0 {
+		return ErrorCode{Name: "ReleaseSync", Code: uint32(r)}
+	}
+	return nil
 }
 
 func (d *Device) CreateRenderTargetView(res *Resource) (*RenderTargetView, error) {

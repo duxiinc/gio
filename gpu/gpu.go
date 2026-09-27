@@ -27,6 +27,7 @@ import (
 	"gioui.org/internal/stroke"
 	"gioui.org/layout"
 	"gioui.org/op"
+	"gioui.org/op/paint"
 	"gioui.org/shader"
 	"gioui.org/shader/gio"
 
@@ -189,8 +190,16 @@ const (
 // imageOpData is the shadow of paint.ImageOp.
 type imageOpData struct {
 	src    *image.RGBA
+	shared *paint.SharedImage
 	handle any
 	filter byte
+}
+
+func (d imageOpData) size() image.Point {
+	if d.shared != nil {
+		return image.Pt(d.shared.Width, d.shared.Height)
+	}
+	return d.src.Bounds().Size()
 }
 
 type linearGradientOpData struct {
@@ -201,12 +210,26 @@ type linearGradientOpData struct {
 }
 
 func decodeImageOp(data []byte, refs []any) imageOpData {
+	if len(refs) < 2 {
+		return imageOpData{}
+	}
 	handle := refs[1]
 	if handle == nil {
 		return imageOpData{}
 	}
+	if shared, ok := refs[0].(*paint.SharedImage); ok {
+		return imageOpData{
+			shared: shared,
+			handle: handle,
+			filter: data[1],
+		}
+	}
+	src, _ := refs[0].(*image.RGBA)
+	if src == nil {
+		return imageOpData{}
+	}
 	return imageOpData{
-		src:    refs[0].(*image.RGBA),
+		src:    src,
 		handle: handle,
 		filter: data[1],
 	}
@@ -452,6 +475,11 @@ func (r *renderer) texHandle(cache *textureCache, data imageOpData) driver.Textu
 		filter: data.filter,
 		handle: data.handle,
 	}
+	// One shader view per shared texture. The sampler filter can change
+	// without opening the resource again.
+	if data.shared != nil {
+		key.filter = 0
+	}
 
 	var tex *texture
 	t, exists := cache.get(key)
@@ -463,6 +491,19 @@ func (r *renderer) texHandle(cache *textureCache, data imageOpData) driver.Textu
 	}
 	tex = t.(*texture)
 	if tex.tex != nil {
+		if data.shared != nil {
+			if err := setTextureFilter(tex.tex, data.filter); err != nil {
+				panic(err)
+			}
+		}
+		return tex.tex
+	}
+	if data.shared != nil {
+		handle, err := newSharedTexture(r.ctx, data)
+		if err != nil {
+			panic(err)
+		}
+		tex.tex = handle
 		return tex.tex
 	}
 
@@ -485,6 +526,35 @@ func (r *renderer) texHandle(cache *textureCache, data imageOpData) driver.Textu
 	driver.UploadImage(handle, image.Pt(0, 0), data.src)
 	tex.tex = handle
 	return tex.tex
+}
+
+func sharedFilters(filter byte) (driver.TextureFilter, driver.TextureFilter) {
+	if filter == filterNearest {
+		return driver.FilterNearest, driver.FilterNearest
+	}
+	return driver.FilterLinear, driver.FilterLinear
+}
+
+func setTextureFilter(tex driver.Texture, filter byte) error {
+	s, ok := tex.(interface {
+		SetFilter(min, mag driver.TextureFilter) error
+	})
+	if !ok {
+		return nil
+	}
+	minF, magF := sharedFilters(filter)
+	return s.SetFilter(minF, magF)
+}
+
+func newSharedTexture(ctx driver.Device, data imageOpData) (driver.Texture, error) {
+	imp, ok := ctx.(interface {
+		NewSharedTexture(handle uintptr, width, height int, minFilter, magFilter driver.TextureFilter) (driver.Texture, error)
+	})
+	if !ok {
+		return nil, fmt.Errorf("gpu: shared images require Direct3D 11")
+	}
+	minF, magF := sharedFilters(data.filter)
+	return imp.NewSharedTexture(data.shared.Handle, data.shared.Width, data.shared.Height, minF, magF)
 }
 
 func (t *texture) release() {
@@ -1084,7 +1154,7 @@ loop:
 			inf := float32(1e6)
 			dst := f32.Rect(-inf, -inf, inf, inf)
 			if state.matType == materialTexture {
-				sz := state.image.src.Rect.Size()
+				sz := state.image.size()
 				dst = f32.Rectangle{Max: layout.FPt(sz)}
 			}
 			clipData, bnd, partialTrans := d.boundsForTransformedRect(dst, t)
@@ -1179,7 +1249,7 @@ func (d *drawState) materialFor(rect f32.Rectangle, off f32.Point, partTrans f32
 	case materialTexture:
 		m.material = materialTexture
 		dr := rect.Add(off).Round()
-		sz := d.image.src.Bounds().Size()
+		sz := d.image.size()
 		sr := f32.Rectangle{
 			Max: f32.Point{
 				X: float32(sz.X),
