@@ -551,7 +551,7 @@ func newSharedTexture(ctx driver.Device, data imageOpData) (driver.Texture, erro
 		NewSharedTexture(handle uintptr, width, height int, minFilter, magFilter driver.TextureFilter) (driver.Texture, error)
 	})
 	if !ok {
-		return nil, fmt.Errorf("gpu: shared images require Direct3D 11")
+		return nil, fmt.Errorf("gpu: shared images are not supported by this renderer")
 	}
 	minF, magF := sharedFilters(data.filter)
 	return imp.NewSharedTexture(data.shared.Handle, data.shared.Width, data.shared.Height, minF, magF)

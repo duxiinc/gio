@@ -14,9 +14,10 @@ import (
 
 /*
 #cgo CFLAGS: -Werror -xobjective-c -fobjc-arc
-#cgo LDFLAGS: -framework CoreGraphics -framework Metal -framework Foundation
+#cgo LDFLAGS: -framework CoreGraphics -framework Metal -framework Foundation -framework IOSurface
 
 #include <CoreFoundation/CoreFoundation.h>
+#include <IOSurface/IOSurfaceRef.h>
 #include <Metal/Metal.h>
 
 typedef struct {
@@ -313,6 +314,59 @@ static CFTypeRef newTexture(CFTypeRef devRef, NSUInteger width, NSUInteger heigh
 	}
 }
 
+static CFTypeRef newSharedBGRA(CFTypeRef devRef, IOSurfaceRef surf, NSUInteger width, NSUInteger height) {
+	@autoreleasepool {
+		id<MTLDevice> dev = (__bridge id<MTLDevice>)devRef;
+		MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB
+																						 width:width
+																						height:height
+																					 mipmapped:NO];
+		desc.usage = MTLTextureUsageShaderRead;
+		BOOL unified = NO;
+		if ([dev respondsToSelector:@selector(hasUnifiedMemory)]) {
+			unified = dev.hasUnifiedMemory;
+		}
+		MTLStorageMode storage = MTLStorageModeShared;
+		if (!unified) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+			storage = MTLStorageModeManaged;
+#pragma clang diagnostic pop
+		}
+		desc.storageMode = storage;
+		id<MTLTexture> tex = [dev newTextureWithDescriptor:desc iosurface:surf plane:0];
+		if (tex == nil) {
+			return NULL;
+		}
+		return CFBridgingRetain(tex);
+	}
+}
+
+static void releaseSharedTexture(CFTypeRef cmdRef, CFTypeRef texRef, IOSurfaceRef surf) {
+	id<MTLTexture> tex = (__bridge_transfer id<MTLTexture>)texRef;
+	IOSurfaceRef held = NULL;
+	if (surf) {
+		held = (IOSurfaceRef)CFRetain(surf);
+	}
+	if (cmdRef) {
+		id<MTLCommandBuffer> cmd = (__bridge id<MTLCommandBuffer>)cmdRef;
+		[cmd addCompletedHandler:^(id<MTLCommandBuffer> b) {
+			(void)b;
+			(void)tex;
+			if (held) {
+				IOSurfaceDecrementUseCount(held);
+				CFRelease(held);
+			}
+		}];
+		return;
+	}
+	(void)tex;
+	if (held) {
+		IOSurfaceDecrementUseCount(held);
+		CFRelease(held);
+	}
+}
+
 static CFTypeRef newSampler(CFTypeRef devRef, MTLSamplerMinMagFilter minFilter, MTLSamplerMinMagFilter magFilter, MTLSamplerMipFilter mipFilter) {
 	@autoreleasepool {
 		id<MTLDevice> dev = (__bridge id<MTLDevice>)devRef;
@@ -453,6 +507,8 @@ type Texture struct {
 	height  int
 	mipmap  bool
 	foreign bool
+	shared  bool
+	surface C.IOSurfaceRef
 }
 
 type Shader struct {
@@ -645,6 +701,39 @@ func (b *Backend) NewTexture(format driver.TextureFormat, width, height int, min
 		return nil, errors.New("metal: [MTLDevice newSamplerStateWithDescriptor:] failed")
 	}
 	return &Texture{backend: b, texture: tex, sampler: s, width: width, height: height, mipmap: mipmap}, nil
+}
+
+// NewSharedTexture imports a BGRA IOSurface and samples it as sRGB so the
+// swapchain does not apply gamma a second time. The use count is incremented
+// here and decremented when the last command buffer that could sample the
+// texture has completed.
+func (b *Backend) NewSharedTexture(handle uintptr, width, height int, minFilter, magFilter driver.TextureFilter) (driver.Texture, error) {
+	if handle == 0 || width < 1 || height < 1 {
+		return nil, fmt.Errorf("metal: shared texture %dx%d", width, height)
+	}
+	surf := C.IOSurfaceRef(unsafe.Pointer(handle))
+	tex := C.newSharedBGRA(b.dev, surf, C.NSUInteger(width), C.NSUInteger(height))
+	if tex == 0 {
+		return nil, errors.New("metal: newTextureWithDescriptor:iosurface: failed")
+	}
+	C.IOSurfaceIncrementUseCount(surf)
+	min, mip := samplerFilterFor(minFilter)
+	max, _ := samplerFilterFor(magFilter)
+	s := C.newSampler(b.dev, min, max, mip)
+	if s == 0 {
+		C.IOSurfaceDecrementUseCount(surf)
+		C.CFRelease(tex)
+		return nil, errors.New("metal: [MTLDevice newSamplerStateWithDescriptor:] failed")
+	}
+	return &Texture{
+		backend: b,
+		texture: tex,
+		sampler: s,
+		width:   width,
+		height:  height,
+		shared:  true,
+		surface: surf,
+	}, nil
 }
 
 func samplerFilterFor(f driver.TextureFilter) (C.MTLSamplerMinMagFilter, C.MTLSamplerMipFilter) {
@@ -953,6 +1042,18 @@ func (t *Texture) Upload(offset, size image.Point, pixels []byte, stride int) {
 func (t *Texture) Release() {
 	if t.foreign {
 		panic("metal: release of external texture")
+	}
+	if t.shared {
+		cmd := C.CFTypeRef(0)
+		if t.backend != nil {
+			cmd = t.backend.lastCmdBuffer
+		}
+		C.releaseSharedTexture(cmd, t.texture, t.surface)
+		if t.sampler != 0 {
+			C.CFRelease(t.sampler)
+		}
+		*t = Texture{}
+		return
 	}
 	C.CFRelease(t.texture)
 	C.CFRelease(t.sampler)

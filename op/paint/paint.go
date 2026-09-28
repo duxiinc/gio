@@ -25,14 +25,16 @@ const (
 	FilterNearest
 )
 
-// SharedImage is a D3D11 texture created in another device with
-// D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX. The Windows D3D11 renderer opens
-// it and samples it as BGRA. The producer AcquireSync(0) / ReleaseSync(1);
-// the renderer holds key 1 until the texture is no longer painted.
-// Other renderers cannot sample it.
+// SharedImage is a BGRA texture owned by the producer.
+// On Windows, Handle is the HANDLE from IDXGIResource::GetSharedHandle of a
+// D3D11 texture created with D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX. The
+// producer AcquireSync(0) / ReleaseSync(1); the renderer holds key 1 until
+// the texture is no longer painted. The HANDLE must not be closed.
+// On Darwin, Handle is an IOSurfaceRef of BGRA bytes. The producer keeps the
+// surface alive and reuses it only after its use count returns to zero. The
+// Metal renderer increments that count after a successful import and
+// decrements it when the GPU has finished sampling.
 type SharedImage struct {
-	// Handle is the HANDLE from IDXGIResource::GetSharedHandle.
-	// It must not be closed.
 	Handle uintptr
 	Width  int
 	Height int
