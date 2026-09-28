@@ -342,28 +342,12 @@ static CFTypeRef newSharedBGRA(CFTypeRef devRef, IOSurfaceRef surf, NSUInteger w
 	}
 }
 
-static void releaseSharedTexture(CFTypeRef cmdRef, CFTypeRef texRef, IOSurfaceRef surf) {
-	id<MTLTexture> tex = (__bridge_transfer id<MTLTexture>)texRef;
-	IOSurfaceRef held = NULL;
+static void releaseSharedTexture(CFTypeRef texRef, IOSurfaceRef surf) {
+	if (texRef) {
+		CFRelease(texRef);
+	}
 	if (surf) {
-		held = (IOSurfaceRef)CFRetain(surf);
-	}
-	if (cmdRef) {
-		id<MTLCommandBuffer> cmd = (__bridge id<MTLCommandBuffer>)cmdRef;
-		[cmd addCompletedHandler:^(id<MTLCommandBuffer> b) {
-			(void)b;
-			(void)tex;
-			if (held) {
-				IOSurfaceDecrementUseCount(held);
-				CFRelease(held);
-			}
-		}];
-		return;
-	}
-	(void)tex;
-	if (held) {
-		IOSurfaceDecrementUseCount(held);
-		CFRelease(held);
+		IOSurfaceDecrementUseCount(surf);
 	}
 }
 
@@ -705,8 +689,8 @@ func (b *Backend) NewTexture(format driver.TextureFormat, width, height int, min
 
 // NewSharedTexture imports a BGRA IOSurface and samples it as sRGB so the
 // swapchain does not apply gamma a second time. The use count is incremented
-// here and decremented when the last command buffer that could sample the
-// texture has completed.
+// here and decremented in Release. Release runs on a later frame, after
+// BeginFrame has waited for the command buffer that sampled the texture.
 func (b *Backend) NewSharedTexture(handle uintptr, width, height int, minFilter, magFilter driver.TextureFilter) (driver.Texture, error) {
 	if handle == 0 || width < 1 || height < 1 {
 		return nil, fmt.Errorf("metal: shared texture %dx%d", width, height)
@@ -1044,11 +1028,7 @@ func (t *Texture) Release() {
 		panic("metal: release of external texture")
 	}
 	if t.shared {
-		cmd := C.CFTypeRef(0)
-		if t.backend != nil {
-			cmd = t.backend.lastCmdBuffer
-		}
-		C.releaseSharedTexture(cmd, t.texture, t.surface)
+		C.releaseSharedTexture(t.texture, t.surface)
 		if t.sampler != 0 {
 			C.CFRelease(t.sampler)
 		}
