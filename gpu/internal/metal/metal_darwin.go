@@ -342,15 +342,6 @@ static CFTypeRef newSharedBGRA(CFTypeRef devRef, IOSurfaceRef surf, NSUInteger w
 	}
 }
 
-static void releaseSharedTexture(CFTypeRef texRef, IOSurfaceRef surf) {
-	if (texRef) {
-		CFRelease(texRef);
-	}
-	if (surf) {
-		IOSurfaceDecrementUseCount(surf);
-	}
-}
-
 static CFTypeRef newSampler(CFTypeRef devRef, MTLSamplerMinMagFilter minFilter, MTLSamplerMinMagFilter magFilter, MTLSamplerMipFilter mipFilter) {
 	@autoreleasepool {
 		id<MTLDevice> dev = (__bridge id<MTLDevice>)devRef;
@@ -1028,7 +1019,12 @@ func (t *Texture) Release() {
 		panic("metal: release of external texture")
 	}
 	if t.shared {
-		C.releaseSharedTexture(t.texture, t.surface)
+		if t.texture != 0 {
+			C.CFRelease(t.texture)
+		}
+		if t.surface != 0 {
+			C.IOSurfaceDecrementUseCount(t.surface)
+		}
 		if t.sampler != 0 {
 			C.CFRelease(t.sampler)
 		}
