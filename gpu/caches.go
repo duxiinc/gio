@@ -4,6 +4,7 @@ package gpu
 
 import (
 	"fmt"
+	"image"
 
 	"gioui.org/internal/f32"
 )
@@ -14,13 +15,25 @@ type textureCacheKey struct {
 }
 
 type textureCache struct {
-	res map[textureCacheKey]resourceCacheValue
+	res map[textureCacheKey]textureCacheValue
+	// spare holds image textures evicted by the last frame. A streamed image
+	// gets a new ImageOp handle every frame, so without this every frame
+	// would allocate a texture of the same size.
+	spare []*texture
 }
 
-type resourceCacheValue struct {
-	used     bool
-	resource resource
+type textureCacheValue struct {
+	used bool
+	idle int
+	tex  *texture
 }
+
+// sharedIdleFrames is how many frames a lockable shared texture stays open
+// unpainted. Producers rotate a few slots, so each comes back within a few
+// frames and reopening it would cost a resource open and a new view.
+const sharedIdleFrames = 8
+
+const maxSpareTextures = 2
 
 // opCache is like a resourceCache but using concrete types and a
 // freelist instead of two maps to avoid runtime.mapaccess2 calls
@@ -44,49 +57,90 @@ type opCacheValue struct {
 
 func newTextureCache() *textureCache {
 	return &textureCache{
-		res: make(map[textureCacheKey]resourceCacheValue),
+		res: make(map[textureCacheKey]textureCacheValue),
 	}
 }
 
-func (r *textureCache) get(key textureCacheKey) (resource, bool) {
+func (r *textureCache) get(key textureCacheKey) (*texture, bool) {
 	v, exists := r.res[key]
 	if !exists {
 		return nil, false
 	}
 	if !v.used {
 		v.used = true
+		v.idle = 0
 		r.res[key] = v
 	}
-	return v.resource, exists
+	return v.tex, true
 }
 
-func (r *textureCache) put(key textureCacheKey, val resource) {
+func (r *textureCache) put(key textureCacheKey, tex *texture) {
 	v, exists := r.res[key]
 	if exists && v.used {
 		panic(fmt.Errorf("key exists, %v", key))
 	}
-	v.used = true
-	v.resource = val
-	r.res[key] = v
+	r.res[key] = textureCacheValue{used: true, tex: tex}
+}
+
+func (r *textureCache) drop(key textureCacheKey) {
+	if v, ok := r.res[key]; ok {
+		delete(r.res, key)
+		v.tex.release()
+	}
+}
+
+// takeSpare returns an evicted image texture of the given size and filter.
+func (r *textureCache) takeSpare(size image.Point, filter byte) *texture {
+	for i, t := range r.spare {
+		if t.size == size && t.filter == filter {
+			last := len(r.spare) - 1
+			r.spare[i] = r.spare[last]
+			r.spare[last] = nil
+			r.spare = r.spare[:last]
+			return t
+		}
+	}
+	return nil
 }
 
 func (r *textureCache) frame() {
+	for _, t := range r.spare {
+		t.release()
+	}
+	clear(r.spare)
+	r.spare = r.spare[:0]
 	for k, v := range r.res {
-		if v.used {
+		switch {
+		case v.used:
+			if v.tex.lock != nil {
+				v.tex.lock.ReleaseShared()
+			}
 			v.used = false
 			r.res[k] = v
-		} else {
+		case v.tex.lock != nil && v.idle < sharedIdleFrames:
+			v.idle++
+			r.res[k] = v
+		default:
 			delete(r.res, k)
-			v.resource.release()
+			if v.tex.src != nil && len(r.spare) < maxSpareTextures {
+				v.tex.src = nil
+				r.spare = append(r.spare, v.tex)
+			} else {
+				v.tex.release()
+			}
 		}
 	}
 }
 
 func (r *textureCache) release() {
 	for _, v := range r.res {
-		v.resource.release()
+		v.tex.release()
+	}
+	for _, t := range r.spare {
+		t.release()
 	}
 	r.res = nil
+	r.spare = nil
 }
 
 func newOpCache() *opCache {

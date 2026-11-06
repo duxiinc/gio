@@ -272,13 +272,21 @@ func decodeLinearGradientOp(data []byte) linearGradientOpData {
 	}
 }
 
-type resource interface {
-	release()
+type texture struct {
+	src    *image.RGBA
+	tex    driver.Texture
+	size   image.Point
+	filter byte
+	// lock is set for a shared texture whose backend hands the producer's
+	// lock back at the end of every frame. Such a texture stays open while
+	// the producer rotates its slots.
+	lock sharedLock
 }
 
-type texture struct {
-	src *image.RGBA
-	tex driver.Texture
+// sharedLock is implemented by shared textures that can be locked per frame.
+type sharedLock interface {
+	AcquireShared() error
+	ReleaseShared()
 }
 
 type blitter struct {
@@ -470,62 +478,74 @@ func (g *gpu) Profile() string {
 	return g.profile
 }
 
+// texHandle returns the texture for an image op, or nil when a shared
+// texture could not be locked for this frame.
 func (r *renderer) texHandle(cache *textureCache, data imageOpData) driver.Texture {
+	if data.shared != nil {
+		return r.sharedTexHandle(cache, data)
+	}
 	key := textureCacheKey{
 		filter: data.filter,
 		handle: data.handle,
 	}
-	// One shader view per shared texture. The sampler filter can change
-	// without opening the resource again.
-	if data.shared != nil {
-		key.filter = 0
+	if t, ok := cache.get(key); ok {
+		return t.tex
 	}
-
-	var tex *texture
-	t, exists := cache.get(key)
-	if !exists {
-		t = &texture{
-			src: data.src,
+	size := data.src.Bounds().Size()
+	t := cache.takeSpare(size, data.filter)
+	if t == nil {
+		var minFilter, magFilter driver.TextureFilter
+		switch data.filter {
+		case filterLinear:
+			minFilter, magFilter = driver.FilterLinearMipmapLinear, driver.FilterLinear
+		case filterNearest:
+			minFilter, magFilter = driver.FilterNearest, driver.FilterNearest
 		}
-		cache.put(key, t)
-	}
-	tex = t.(*texture)
-	if tex.tex != nil {
-		if data.shared != nil {
-			if err := setTextureFilter(tex.tex, data.filter); err != nil {
-				panic(err)
-			}
-		}
-		return tex.tex
-	}
-	if data.shared != nil {
-		handle, err := newSharedTexture(r.ctx, data)
+		handle, err := r.ctx.NewTexture(driver.TextureFormatSRGBA,
+			size.X, size.Y,
+			minFilter, magFilter,
+			driver.BufferBindingTexture,
+		)
 		if err != nil {
 			panic(err)
 		}
-		tex.tex = handle
-		return tex.tex
+		t = &texture{tex: handle, size: size, filter: data.filter}
 	}
+	t.src = data.src
+	driver.UploadImage(t.tex, image.Pt(0, 0), data.src)
+	cache.put(key, t)
+	return t.tex
+}
 
-	var minFilter, magFilter driver.TextureFilter
-	switch data.filter {
-	case filterLinear:
-		minFilter, magFilter = driver.FilterLinearMipmapLinear, driver.FilterLinear
-	case filterNearest:
-		minFilter, magFilter = driver.FilterNearest, driver.FilterNearest
+// sharedTexHandle keeps one shader view per shared texture. The sampler
+// filter can change without opening the resource again.
+func (r *renderer) sharedTexHandle(cache *textureCache, data imageOpData) driver.Texture {
+	key := textureCacheKey{handle: data.handle}
+	size := data.size()
+	t, ok := cache.get(key)
+	if ok && t.size != size {
+		cache.drop(key)
+		ok = false
 	}
-
-	handle, err := r.ctx.NewTexture(driver.TextureFormatSRGBA,
-		data.src.Bounds().Dx(), data.src.Bounds().Dy(),
-		minFilter, magFilter,
-		driver.BufferBindingTexture,
-	)
-	if err != nil {
-		panic(err)
+	if ok {
+		if err := setTextureFilter(t.tex, data.filter); err != nil {
+			panic(err)
+		}
+	} else {
+		tex, err := newSharedTexture(r.ctx, data)
+		if err != nil {
+			panic(err)
+		}
+		t = &texture{tex: tex, size: size}
+		t.lock, _ = tex.(sharedLock)
+		cache.put(key, t)
 	}
-	driver.UploadImage(handle, image.Pt(0, 0), data.src)
-	tex.tex = handle
-	return tex.tex
+	if t.lock != nil {
+		if err := t.lock.AcquireShared(); err != nil {
+			return nil
+		}
+	}
+	return t.tex
 }
 
 func sharedFilters(filter byte) (driver.TextureFilter, driver.TextureFilter) {
@@ -1276,7 +1296,14 @@ func (r *renderer) uploadImages(cache *textureCache, ops []imageOp) {
 		img := &ops[i]
 		m := img.material
 		if m.material == materialTexture {
-			img.material.tex = r.texHandle(cache, m.data)
+			tex := r.texHandle(cache, m.data)
+			if tex == nil {
+				// The producer is still writing the shared texture. Paint
+				// nothing this frame rather than sample it unlocked.
+				img.material = material{material: materialColor}
+				continue
+			}
+			img.material.tex = tex
 		}
 	}
 }

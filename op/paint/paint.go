@@ -28,8 +28,10 @@ const (
 // SharedImage is a BGRA texture owned by the producer.
 // On Windows, Handle is the HANDLE from IDXGIResource::GetSharedHandle of a
 // D3D11 texture created with D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX. The
-// producer AcquireSync(0) / ReleaseSync(1); the renderer holds key 1 until
-// the texture is no longer painted. The HANDLE must not be closed.
+// producer AcquireSync(0) / ReleaseSync(1). The renderer keeps the texture
+// open across frames and holds key 1 only while a frame samples it, handing
+// key 1 back afterwards. The producer reclaims a slot it no longer presents
+// by taking key 1 and releasing key 0. The HANDLE must not be closed.
 // On Darwin, Handle is an IOSurfaceRef of BGRA bytes. The producer keeps the
 // surface alive and reuses it only after its use count returns to zero. The
 // Metal renderer increments that count after a successful import and

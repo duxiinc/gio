@@ -349,9 +349,9 @@ func (b *Backend) NewTexture(format driver.TextureFormat, width, height int, min
 }
 
 // NewSharedTexture opens a HANDLE shared from another D3D11 device and
-// samples it as BGRA. The texture must use a keyed mutex. Key 1 is acquired
-// here and released in Texture.Release, which runs once the texture drops
-// out of the frame cache.
+// samples it as BGRA. The texture must use a keyed mutex. The renderer takes
+// key 1 with AcquireShared before each frame samples it and hands it back
+// with ReleaseShared, so the texture stays open across frames.
 func (b *Backend) NewSharedTexture(handle uintptr, width, height int, minFilter, magFilter driver.TextureFilter) (driver.Texture, error) {
 	if handle == 0 || width < 1 || height < 1 {
 		return nil, fmt.Errorf("d3d11: shared texture %dx%d handle=%#x", width, height, handle)
@@ -367,21 +367,14 @@ func (b *Backend) NewSharedTexture(handle uintptr, width, height int, minFilter,
 		return nil, fmt.Errorf("d3d11: keyed mutex: %w", err)
 	}
 	keyed := (*d3d11.KeyedMutex)(unsafe.Pointer(kunk))
-	if err := keyed.AcquireSync(1, 32); err != nil {
-		d3d11.IUnknownRelease(unsafe.Pointer(keyed), keyed.Vtbl.Release)
-		d3d11.IUnknownRelease(unsafe.Pointer(tex), tex.Vtbl.Release)
-		return nil, fmt.Errorf("d3d11: AcquireSync: %w", err)
-	}
 	sampler, err := newSampler(b.dev, minFilter, magFilter)
 	if err != nil {
-		_ = keyed.ReleaseSync(0)
 		d3d11.IUnknownRelease(unsafe.Pointer(keyed), keyed.Vtbl.Release)
 		d3d11.IUnknownRelease(unsafe.Pointer(tex), tex.Vtbl.Release)
 		return nil, err
 	}
 	resView, err := newBGRAView(b.dev, tex)
 	if err != nil {
-		_ = keyed.ReleaseSync(0)
 		d3d11.IUnknownRelease(unsafe.Pointer(sampler), sampler.Vtbl.Release)
 		d3d11.IUnknownRelease(unsafe.Pointer(keyed), keyed.Vtbl.Release)
 		d3d11.IUnknownRelease(unsafe.Pointer(tex), tex.Vtbl.Release)
@@ -399,8 +392,30 @@ func (b *Backend) NewSharedTexture(handle uintptr, width, height int, minFilter,
 		minFilter: minFilter,
 		magFilter: magFilter,
 		keyed:     keyed,
-		keyedHeld: true,
 	}, nil
+}
+
+// AcquireShared takes key 1, which the producer releases once a picture is
+// written.
+func (t *Texture) AcquireShared() error {
+	if t.keyed == nil || t.keyedHeld {
+		return nil
+	}
+	if err := t.keyed.AcquireSync(1, 32); err != nil {
+		return fmt.Errorf("d3d11: AcquireSync: %w", err)
+	}
+	t.keyedHeld = true
+	return nil
+}
+
+// ReleaseShared hands key 1 back once the frame's draws are recorded. The
+// picture stays published: the next frame can sample it again and the
+// producer can reclaim the slot when it is no longer the latest.
+func (t *Texture) ReleaseShared() {
+	if t.keyedHeld {
+		_ = t.keyed.ReleaseSync(1)
+		t.keyedHeld = false
+	}
 }
 
 func (t *Texture) SetFilter(minFilter, magFilter driver.TextureFilter) error {
@@ -761,10 +776,7 @@ func (t *Texture) Release() {
 	if t.foreign {
 		panic("texture not created by NewTexture")
 	}
-	if t.keyedHeld && t.keyed != nil {
-		_ = t.keyed.ReleaseSync(0)
-		t.keyedHeld = false
-	}
+	t.ReleaseShared()
 	if t.keyed != nil {
 		d3d11.IUnknownRelease(unsafe.Pointer(t.keyed), t.keyed.Vtbl.Release)
 		t.keyed = nil
