@@ -8,7 +8,6 @@ import (
 	"image"
 	"unsafe"
 
-	"gioui.org/gpu/frametime"
 	"gioui.org/gpu/internal/driver"
 	"gioui.org/shader"
 )
@@ -20,7 +19,6 @@ import (
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOSurface/IOSurfaceRef.h>
 #include <Metal/Metal.h>
-#include <mach/mach_time.h>
 
 typedef struct {
 	void *addr;
@@ -60,34 +58,6 @@ static CFTypeRef queueNewBuffer(CFTypeRef queueRef) {
 static void cmdBufferCommit(CFTypeRef cmdBufRef) {
 	@autoreleasepool {
 		id<MTLCommandBuffer> cmdBuf = (__bridge id<MTLCommandBuffer>)cmdBufRef;
-		[cmdBuf commit];
-	}
-}
-
-extern void gioMetalFrameTimed(uintptr_t target, double commit, double start, double end, double now);
-
-// hostSeconds is mach host time in seconds, the clock of
-// MTLCommandBuffer.GPUStartTime and CACurrentMediaTime.
-static double hostSeconds(void) {
-	static mach_timebase_info_data_t tb;
-	if (tb.denom == 0) {
-		mach_timebase_info(&tb);
-	}
-	return (double)mach_absolute_time() * tb.numer / tb.denom / 1e9;
-}
-
-static void cmdBufferCommitTimed(CFTypeRef cmdBufRef, uintptr_t target) {
-	@autoreleasepool {
-		id<MTLCommandBuffer> cmdBuf = (__bridge id<MTLCommandBuffer>)cmdBufRef;
-		double commit = hostSeconds();
-		[cmdBuf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
-			double start = 0, end = 0;
-			if (@available(macOS 10.15, iOS 10.3, *)) {
-				start = cb.GPUStartTime;
-				end = cb.GPUEndTime;
-			}
-			gioMetalFrameTimed(target, commit, start, end, hostSeconds());
-		}];
 		[cmdBuf commit];
 	}
 }
@@ -486,12 +456,9 @@ type Backend struct {
 
 	cmdBuffer     C.CFTypeRef
 	lastCmdBuffer C.CFTypeRef
-	// frameTarget is the window texture of the current frame, reported with
-	// its GPU timing; 0 for offscreen frames.
-	frameTarget uintptr
-	renderEnc   C.CFTypeRef
-	computeEnc  C.CFTypeRef
-	blitEnc     C.CFTypeRef
+	renderEnc     C.CFTypeRef
+	computeEnc    C.CFTypeRef
+	blitEnc       C.CFTypeRef
 
 	prog     *Program
 	topology C.MTLPrimitiveType
@@ -578,13 +545,11 @@ func (b *Backend) BeginFrame(target driver.RenderTarget, clear bool, viewport im
 		C.cmdBufferWaitUntilCompleted(b.lastCmdBuffer)
 		b.stagingOff = 0
 	}
-	b.frameTarget = 0
 	if target == nil {
 		return nil
 	}
 	switch t := target.(type) {
 	case driver.MetalRenderTarget:
-		b.frameTarget = t.Texture
 		texture := C.CFTypeRef(t.Texture)
 		return &Texture{texture: texture, foreign: true}
 	case *Texture:
@@ -633,30 +598,15 @@ func (b *Backend) CopyTexture(dst driver.Texture, dorig image.Point, src driver.
 }
 
 func (b *Backend) EndFrame() {
-	target := b.frameTarget
-	b.frameTarget = 0
-	if !frametime.Enabled() {
-		target = 0
-	}
-	b.commitCmdBuffer(false, target)
+	b.endCmdBuffer(false)
 }
 
 func (b *Backend) endCmdBuffer(wait bool) {
-	b.commitCmdBuffer(wait, 0)
-}
-
-// commitCmdBuffer commits the open command buffer. A non-zero target has
-// its GPU timing reported to frametime.
-func (b *Backend) commitCmdBuffer(wait bool, target uintptr) {
 	b.endEncoder()
 	if b.cmdBuffer == 0 {
 		return
 	}
-	if target != 0 {
-		C.cmdBufferCommitTimed(b.cmdBuffer, C.uintptr_t(target))
-	} else {
-		C.cmdBufferCommit(b.cmdBuffer)
-	}
+	C.cmdBufferCommit(b.cmdBuffer)
 	if wait {
 		C.cmdBufferWaitUntilCompleted(b.cmdBuffer)
 	}
